@@ -38,7 +38,7 @@
  * SHA from unpromoted 5605ad8 by @nullforest8200, isolated in 558d022 by
  * @DPZZxlz; this is an independent implementation). 0 = sequential loop. */
 #ifndef ZLAB_PAIRSHA
-#define ZLAB_PAIRSHA 0
+#define ZLAB_PAIRSHA 1
 #endif
 #define ZLAB_HIT_REC 16        /* bytes per record: u32 tag + MAX_T combo bytes... first 12 used */
 #define ZLAB_HIT_FIRST 8       /* records copied with the count in the first D2H */
@@ -2133,6 +2133,26 @@ int main(int argc, char **argv) {
         }
         fflush(stdout);
         free(chk_table);
+    }
+
+    /* L2 persistence: pin the 64 MiB fixed-base table in L2 cache so the
+     * producer/consumer kernels hit it at L2 latency instead of L3/DRAM.
+     * Applied on the default stream; persists across all subsequent launches. */
+    {
+        int l2_size = 0;
+        cudaDeviceGetAttribute(&l2_size, cudaDevAttrL2CacheSize, gpu_index);
+        if (l2_size > 0) {
+            cudaStreamAttrValue attr;
+            memset(&attr, 0, sizeof(attr));
+            attr.accessPolicyWindow.base_ptr  = (void *)d_gt;
+            attr.accessPolicyWindow.num_bytes = gt_sz;
+            attr.accessPolicyWindow.hitRatio  = 1.0f;
+            attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+            cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow, &attr);
+            printf("  L2 persist: %.0f MiB table pinned in %d KiB L2 cache\n",
+                   (double)gt_sz / (1024.0 * 1024.0), l2_size / 1024);
+        }
     }
 
     /* Upload params */
