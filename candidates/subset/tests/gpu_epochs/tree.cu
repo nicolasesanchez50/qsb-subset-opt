@@ -2135,24 +2135,45 @@ int main(int argc, char **argv) {
         free(chk_table);
     }
 
-    /* L2 persistence: pin the 64 MiB fixed-base table in L2 cache so the
-     * producer/consumer kernels hit it at L2 latency instead of L3/DRAM.
-     * Applied on the default stream; persists across all subsequent launches. */
+    /* Pin the fixed-base table in L2. The 64 MiB table is sized to be
+     * L2-resident on the ranked runner's AD102 (72 MB L2), but the pipeline
+     * streams ~2.1 GiB of per-candidate state through the same cache every
+     * batch, which evicts it. Advisory: if the device or driver refuses any
+     * part of this, the run is unaffected.
+     *
+     * BOTH setters are required, and this is the part that is easy to get
+     * wrong. cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, ...) reserves
+     * the set-aside; with the default set-aside the persisting hit property
+     * has no reserved cache to persist into and the window does nothing.
+     * num_bytes must also stay inside accessPolicyMaxWindowSize AND inside the
+     * set-aside actually granted, or cudaStreamSetAttribute fails with
+     * InvalidValue. A refused hint left pending would trip the launch-error
+     * checks further down, inside the measured window, so it is cleared.
+     * Pattern matched to the accepted pinning submission e2fd8093. */
     {
-        int l2_size = 0;
-        cudaDeviceGetAttribute(&l2_size, cudaDevAttrL2CacheSize, gpu_index);
-        if (l2_size > 0) {
-            cudaStreamAttrValue attr;
-            memset(&attr, 0, sizeof(attr));
-            attr.accessPolicyWindow.base_ptr  = (void *)d_gt;
-            attr.accessPolicyWindow.num_bytes = gt_sz;
-            attr.accessPolicyWindow.hitRatio  = 1.0f;
-            attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-            attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-            cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow, &attr);
-            printf("  L2 persist: %.0f MiB table pinned in %d KiB L2 cache\n",
-                   (double)gt_sz / (1024.0 * 1024.0), l2_size / 1024);
+        int max_persist = 0, max_window = 0;
+        cudaDeviceGetAttribute(&max_persist, cudaDevAttrMaxPersistingL2CacheSize, gpu_index);
+        cudaDeviceGetAttribute(&max_window, cudaDevAttrMaxAccessPolicyWindowSize, gpu_index);
+        size_t want = gt_sz < (size_t)max_persist ? gt_sz : (size_t)max_persist;
+        if (want > 0 && max_window > 0) {
+            cudaError_t le = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, want);
+            cudaStreamAttrValue av = {};
+            av.accessPolicyWindow.base_ptr  = (void *)d_gt;
+            av.accessPolicyWindow.num_bytes = want < (size_t)max_window ? want : (size_t)max_window;
+            av.accessPolicyWindow.hitRatio  = 1.0f;
+            av.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+            av.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+            cudaError_t pe = cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow, &av);
+            printf("  L2 persistence: %.0f MiB pinned (max %.0f MiB, window %.0f MiB) limit=%s window=%s\n",
+                   (double)av.accessPolicyWindow.num_bytes/(1024*1024),
+                   (double)max_persist/(1024*1024), (double)max_window/(1024*1024),
+                   le==cudaSuccess?"ok":cudaGetErrorString(le),
+                   pe==cudaSuccess?"ok":cudaGetErrorString(pe));
+            fflush(stdout);
+        } else {
+            printf("  L2 persistence: not offered by this device\n");
         }
+        cudaGetLastError();  /* a refused hint must not leave a pending error for the launch checks */
     }
 
     /* Upload params */
